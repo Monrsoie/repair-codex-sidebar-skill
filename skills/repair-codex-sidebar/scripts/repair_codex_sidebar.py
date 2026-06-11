@@ -19,6 +19,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -149,7 +150,7 @@ def merge_old_user_data(codex_home: Path, old_home: Path) -> dict[str, int]:
 
 def read_json(path: Path, fallback: Any) -> Any:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8-sig"))
     except Exception:
         return fallback
 
@@ -187,6 +188,143 @@ def to_extended_windows_path(value: Any) -> Any:
     if isinstance(path, str) and len(path) >= 3 and path[1:3] == ":\\":
         return "\\\\?\\" + path
     return path
+
+
+def coerce_string_list(value: Any) -> list[str]:
+    if isinstance(value, str) and value.strip():
+        return [value]
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, str) and item.strip()]
+    return []
+
+
+def comparable_path(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    path = to_windows_path(value.strip()).replace("/", "\\")
+    return path.rstrip("\\").lower()
+
+
+def path_is_under(path: Any, roots: list[str]) -> bool:
+    key = comparable_path(path)
+    if not key:
+        return False
+    for root in roots:
+        root_key = comparable_path(root)
+        if not root_key:
+            continue
+        if key == root_key or key.startswith(root_key + "\\"):
+            return True
+    return False
+
+
+def path_label(value: str) -> str:
+    path = to_windows_path(value).replace("/", "\\").rstrip("\\")
+    label = path.rsplit("\\", 1)[-1]
+    return label or value
+
+
+def normalized_unique_paths(values: list[Any]) -> list[str]:
+    return unique([to_extended_windows_path(value) for value in values if isinstance(value, str) and value.strip()])
+
+
+def repair_global_project_index(
+    state: dict[str, Any],
+    *,
+    project_roots: list[str] | None = None,
+    preferred_active_root: str | None = None,
+    exclude_root_prefixes: list[str] | None = None,
+    include_hinted_roots: bool = False,
+) -> dict[str, int]:
+    """Repair the lightweight sidebar/project index inside .codex-global-state.json."""
+
+    exclude_root_prefixes = exclude_root_prefixes or []
+    hints = state.get("thread-workspace-root-hints")
+    if not isinstance(hints, dict):
+        hints = {}
+
+    explicit_roots = normalized_unique_paths(project_roots or [])
+    saved_roots = normalized_unique_paths(coerce_string_list(state.get("electron-saved-workspace-roots")))
+    order_roots = normalized_unique_paths(coerce_string_list(state.get("project-order")))
+    hint_roots = normalized_unique_paths(list(hints.values()))
+
+    if explicit_roots:
+        roots = explicit_roots
+    elif include_hinted_roots:
+        roots = unique(saved_roots + order_roots + hint_roots)
+    elif saved_roots:
+        roots = saved_roots
+    elif order_roots:
+        roots = order_roots
+    else:
+        roots = hint_roots
+
+    if exclude_root_prefixes:
+        roots = [root for root in roots if not path_is_under(root, exclude_root_prefixes)]
+
+    normalized_hints = {
+        str(thread_id): to_extended_windows_path(root)
+        for thread_id, root in hints.items()
+        if isinstance(thread_id, str) and isinstance(root, str) and root.strip()
+    }
+    state["thread-workspace-root-hints"] = normalized_hints
+
+    raw_labels = state.get("electron-workspace-root-labels")
+    labels: dict[str, str] = {}
+    if isinstance(raw_labels, dict):
+        for key, value in raw_labels.items():
+            if isinstance(key, str) and isinstance(value, str):
+                labels[to_extended_windows_path(key)] = value
+    for root in roots:
+        labels.setdefault(root, path_label(root))
+
+    raw_active = state.get("active-workspace-roots")
+    active_before_was_list = isinstance(raw_active, list)
+    active_roots = normalized_unique_paths(coerce_string_list(raw_active))
+    preferred = to_extended_windows_path(preferred_active_root) if preferred_active_root else None
+    if preferred and path_is_under(preferred, roots):
+        active_roots = [preferred]
+    else:
+        active_roots = [root for root in active_roots if path_is_under(root, roots)]
+        if not active_roots and roots:
+            active_roots = [roots[0]]
+        elif active_roots:
+            active_roots = [active_roots[0]]
+
+    existing_order = normalized_unique_paths(coerce_string_list(state.get("project-order")))
+    project_order = unique(roots + existing_order)
+
+    projectless_before = coerce_string_list(state.get("projectless-thread-ids"))
+    projectless_after: list[str] = []
+    removed_projectless: list[str] = []
+    for thread_id in projectless_before:
+        hint_root = normalized_hints.get(thread_id)
+        if hint_root and path_is_under(hint_root, roots):
+            removed_projectless.append(thread_id)
+        else:
+            projectless_after.append(thread_id)
+
+    output_dirs = state.get("thread-projectless-output-directories")
+    if isinstance(output_dirs, dict):
+        for thread_id in removed_projectless:
+            output_dirs.pop(thread_id, None)
+
+    state["electron-saved-workspace-roots"] = roots
+    state["electron-workspace-root-labels"] = labels
+    state["active-workspace-roots"] = active_roots
+    state["project-order"] = project_order
+    state["projectless-thread-ids"] = unique(projectless_after)
+
+    return {
+        "project_roots": len(roots),
+        "workspace_labels": len(labels),
+        "active_roots": len(active_roots),
+        "project_order": len(project_order),
+        "projectless_before": len(projectless_before),
+        "projectless_after": len(projectless_after),
+        "removed_projectless": len(removed_projectless),
+        "active_root_type_fixed": 0 if active_before_was_list else 1,
+    }
 
 
 def merge_session_index(codex_home: Path, old_home: Path | None) -> int:
@@ -234,7 +372,15 @@ def merge_prompt_history(old_history: Any, cur_history: Any) -> dict[str, Any]:
     return out
 
 
-def merge_global_state(codex_home: Path, old_home: Path | None) -> dict[str, int]:
+def merge_global_state(
+    codex_home: Path,
+    old_home: Path | None,
+    *,
+    project_roots: list[str] | None = None,
+    preferred_active_root: str | None = None,
+    exclude_root_prefixes: list[str] | None = None,
+    include_hinted_roots: bool = False,
+) -> dict[str, int]:
     cur_path = codex_home / ".codex-global-state.json"
     old_path = old_home / ".codex-global-state.json" if old_home else None
     cur = read_json(cur_path, {})
@@ -278,10 +424,6 @@ def merge_global_state(codex_home: Path, old_home: Path | None) -> dict[str, int
     }
     merged["electron-persisted-atom-state"] = atom
 
-    for key in ["electron-saved-workspace-roots", "project-order", "active-workspace-roots"]:
-        if isinstance(merged.get(key), list):
-            merged[key] = unique([to_extended_windows_path(v) for v in merged[key]])
-
     hints = merged.get("thread-workspace-root-hints") or {}
     merged["thread-workspace-root-hints"] = {
         thread_id: to_extended_windows_path(root) for thread_id, root in hints.items()
@@ -302,11 +444,43 @@ def merge_global_state(codex_home: Path, old_home: Path | None) -> dict[str, int
                 permission["sandboxPolicy"]["writableRoots"] = unique([to_extended_windows_path(v) for v in roots])
 
     merged["runCodexInWindowsSubsystemForLinux"] = False
+    sidebar_stats = repair_global_project_index(
+        merged,
+        project_roots=project_roots,
+        preferred_active_root=preferred_active_root,
+        exclude_root_prefixes=exclude_root_prefixes,
+        include_hinted_roots=include_hinted_roots,
+    )
     write_json(cur_path, merged)
     return {
         "project_roots": len(merged.get("electron-saved-workspace-roots") or []),
         "hints": len(merged.get("thread-workspace-root-hints") or {}),
+        **sidebar_stats,
     }
+
+
+def repair_global_state_file(
+    codex_home: Path,
+    *,
+    project_roots: list[str] | None = None,
+    preferred_active_root: str | None = None,
+    exclude_root_prefixes: list[str] | None = None,
+    include_hinted_roots: bool = False,
+) -> dict[str, int]:
+    path = codex_home / ".codex-global-state.json"
+    state = read_json(path, {})
+    if not isinstance(state, dict):
+        state = {}
+    stats = repair_global_project_index(
+        state,
+        project_roots=project_roots,
+        preferred_active_root=preferred_active_root,
+        exclude_root_prefixes=exclude_root_prefixes,
+        include_hinted_roots=include_hinted_roots,
+    )
+    state["runCodexInWindowsSubsystemForLinux"] = False
+    write_json(path, state)
+    return stats
 
 
 def table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
@@ -439,9 +613,7 @@ def update_hints_from_rows(codex_home: Path, rows: list[tuple[str, str]]) -> Non
         if thread_id and cwd:
             hints[thread_id] = to_extended_windows_path(cwd)
     state["thread-workspace-root-hints"] = hints
-    for key in ["electron-saved-workspace-roots", "project-order", "active-workspace-roots"]:
-        if isinstance(state.get(key), list):
-            state[key] = unique([to_extended_windows_path(v) for v in state[key]])
+    repair_global_project_index(state)
     state["runCodexInWindowsSubsystemForLinux"] = False
     write_json(path, state)
 
@@ -518,6 +690,12 @@ def diagnose(codex_home: Path) -> dict[str, Any]:
     if isinstance(state, dict):
         out["global_hints"] = len(state.get("thread-workspace-root-hints") or {})
         out["project_roots"] = state.get("electron-saved-workspace-roots") or []
+        repaired = json.loads(json.dumps(state, ensure_ascii=False))
+        out["sidebar_index_repair_preview"] = repair_global_project_index(repaired)
+        active_roots = state.get("active-workspace-roots")
+        out["active_workspace_roots_type"] = type(active_roots).__name__
+        labels = state.get("electron-workspace-root-labels")
+        out["workspace_root_labels"] = len(labels) if isinstance(labels, dict) else 0
     out.update(repair_session_meta_dry(codex_home))
     return out
 
@@ -561,6 +739,36 @@ def main() -> int:
     parser.add_argument("--skip-old-copy", action="store_true")
     parser.add_argument("--allow-running-codex", action="store_true")
     parser.add_argument("--diagnose-only", action="store_true")
+    parser.add_argument(
+        "--global-state-only",
+        action="store_true",
+        help="Only repair .codex-global-state.json sidebar/project indexes.",
+    )
+    parser.add_argument(
+        "--project-root",
+        action="append",
+        default=[],
+        help="Explicit local project root to restore. May be passed more than once.",
+    )
+    parser.add_argument("--preferred-active-root", default=None)
+    parser.add_argument(
+        "--exclude-root-prefix",
+        action="append",
+        default=[],
+        help="Root prefix to exclude from restored local project roots. May be passed more than once.",
+    )
+    parser.add_argument(
+        "--include-hinted-roots",
+        action="store_true",
+        help="Also add roots found in thread-workspace-root-hints to the restored project root list.",
+    )
+    parser.add_argument(
+        "--watch-minutes",
+        type=float,
+        default=0,
+        help="Repeat global-state repair for this many minutes while the user quits and reopens Codex.",
+    )
+    parser.add_argument("--watch-interval-seconds", type=float, default=2)
     args = parser.parse_args()
 
     codex_home = args.codex_home.expanduser().resolve()
@@ -577,13 +785,44 @@ def main() -> int:
     backup = backup_codex_home(codex_home, args.backup_root)
     log(f"backup={backup}")
 
+    if args.global_state_only:
+        deadline = time.monotonic() + max(args.watch_minutes, 0) * 60
+        while True:
+            log(
+                "global_state="
+                + json.dumps(
+                    repair_global_state_file(
+                        codex_home,
+                        project_roots=args.project_root,
+                        preferred_active_root=args.preferred_active_root,
+                        exclude_root_prefixes=args.exclude_root_prefix,
+                        include_hinted_roots=args.include_hinted_roots,
+                    ),
+                    ensure_ascii=False,
+                )
+            )
+            if args.watch_minutes <= 0 or time.monotonic() >= deadline:
+                break
+            time.sleep(max(args.watch_interval_seconds, 0.2))
+        log("diagnostics=" + json.dumps(diagnose(codex_home), ensure_ascii=False))
+        log("done")
+        return 0
+
     if not args.skip_old_copy and old_home.exists():
         log(f"copy_old_user_data={merge_old_user_data(codex_home, old_home)}")
     else:
         log("copy_old_user_data=skipped")
 
     log(f"session_index_entries={merge_session_index(codex_home, old_home if old_home.exists() else None)}")
-    log(f"global_state={merge_global_state(codex_home, old_home if old_home.exists() else None)}")
+    global_state_stats = merge_global_state(
+        codex_home,
+        old_home if old_home.exists() else None,
+        project_roots=args.project_root,
+        preferred_active_root=args.preferred_active_root,
+        exclude_root_prefixes=args.exclude_root_prefix,
+        include_hinted_roots=args.include_hinted_roots,
+    )
+    log(f"global_state={global_state_stats}")
     log(f"old_state_import={import_old_state_rows(codex_home, old_home if old_home.exists() else None)}")
     log(f"state_db={normalize_state_db(codex_home)}")
     log(f"session_meta={repair_session_meta(codex_home)}")

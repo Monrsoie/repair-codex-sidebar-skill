@@ -1,4 +1,4 @@
 interface:
-  display_name: "Repair Codex Sidebar"
-  short_description: "Restore local project chats"
-  default_prompt: "Repair my Codex Desktop project sidebar so local conversations from .codex_old appear again."
+  display_name: "Recover Codex Sidebar Threads"
+  short_description: "Restore hidden sidebar chats"
+  default_prompt: "Recover my missing Codex Desktop sidebar conversations and local project threads."
