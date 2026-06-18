@@ -1,5 +1,7 @@
 # Recover Codex Sidebar Threads Skill
 
+[中文说明](README.zh-CN.md)
+
 Recover missing Codex Desktop sidebar threads, local project conversations, and project groups after restoring from `.codex_old`, switching between Windows and WSL, repairing `state_5.sqlite`, or rebuilding local history indexes.
 
 This repository contains a Codex skill at:
