@@ -249,7 +249,7 @@ def repair_global_project_index(
     hint_roots = normalized_unique_paths(list(hints.values()))
 
     if explicit_roots:
-        roots = explicit_roots
+        roots = unique(explicit_roots + (hint_roots if include_hinted_roots else []))
     elif include_hinted_roots:
         roots = unique(saved_roots + order_roots + hint_roots)
     elif saved_roots:
@@ -325,6 +325,39 @@ def repair_global_project_index(
         "removed_projectless": len(removed_projectless),
         "active_root_type_fixed": 0 if active_before_was_list else 1,
     }
+
+
+def read_active_thread_rows(codex_home: Path) -> list[tuple[str, str]]:
+    db = codex_home / "state_5.sqlite"
+    if not db.exists():
+        return []
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        return conn.execute(
+            "SELECT id, cwd FROM threads WHERE archived=0 AND has_user_event=1 AND source='vscode'"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def seed_roots_from_global_state_backups(codex_home: Path) -> list[str]:
+    candidates = sorted(
+        [
+            path
+            for path in codex_home.glob(".codex-global-state.json*")
+            if path.is_file() and path.name != ".codex-global-state.json"
+        ],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for path in candidates:
+        data = read_json(path, {})
+        if not isinstance(data, dict):
+            continue
+        roots = coerce_string_list(data.get("electron-saved-workspace-roots"))
+        if roots:
+            return roots
+    return []
 
 
 def merge_session_index(codex_home: Path, old_home: Path | None) -> int:
@@ -466,18 +499,33 @@ def repair_global_state_file(
     preferred_active_root: str | None = None,
     exclude_root_prefixes: list[str] | None = None,
     include_hinted_roots: bool = False,
+    rebuild_hints_from_state_db: bool = False,
+    seed_roots_from_backups: bool = False,
 ) -> dict[str, int]:
     path = codex_home / ".codex-global-state.json"
     state = read_json(path, {})
     if not isinstance(state, dict):
         state = {}
+    rebuilt_hints = 0
+    if rebuild_hints_from_state_db:
+        hints = state.get("thread-workspace-root-hints")
+        if not isinstance(hints, dict):
+            hints = {}
+        for thread_id, cwd in read_active_thread_rows(codex_home):
+            if thread_id and cwd:
+                hints[str(thread_id)] = to_extended_windows_path(cwd)
+                rebuilt_hints += 1
+        state["thread-workspace-root-hints"] = hints
+    seeded_roots = seed_roots_from_global_state_backups(codex_home) if seed_roots_from_backups else []
     stats = repair_global_project_index(
         state,
-        project_roots=project_roots,
+        project_roots=list(project_roots or []) + seeded_roots,
         preferred_active_root=preferred_active_root,
         exclude_root_prefixes=exclude_root_prefixes,
         include_hinted_roots=include_hinted_roots,
     )
+    stats["rebuilt_hints_from_state_db"] = rebuilt_hints
+    stats["seeded_roots_from_backups"] = len(seeded_roots)
     state["runCodexInWindowsSubsystemForLinux"] = False
     write_json(path, state)
     return stats
@@ -763,6 +811,16 @@ def main() -> int:
         help="Also add roots found in thread-workspace-root-hints to the restored project root list.",
     )
     parser.add_argument(
+        "--rebuild-hints-from-state-db",
+        action="store_true",
+        help="For --global-state-only, rebuild thread-workspace-root-hints from state_5.sqlite without writing SQLite.",
+    )
+    parser.add_argument(
+        "--seed-roots-from-backups",
+        action="store_true",
+        help="For --global-state-only, seed project roots from the newest global-state backup that has saved roots.",
+    )
+    parser.add_argument(
         "--watch-minutes",
         type=float,
         default=0,
@@ -797,6 +855,8 @@ def main() -> int:
                         preferred_active_root=args.preferred_active_root,
                         exclude_root_prefixes=args.exclude_root_prefix,
                         include_hinted_roots=args.include_hinted_roots,
+                        rebuild_hints_from_state_db=args.rebuild_hints_from_state_db,
+                        seed_roots_from_backups=args.seed_roots_from_backups,
                     ),
                     ensure_ascii=False,
                 )

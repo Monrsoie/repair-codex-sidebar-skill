@@ -41,6 +41,10 @@ python scripts/repair_codex_sidebar.py --global-state-only
 
 If the project roots themselves are missing, pass known roots explicitly with `--project-root`, or use `--include-hinted-roots` to add roots found in `thread-workspace-root-hints`. Pair that with `--exclude-root-prefix` when recovery workspaces or temporary agent folders should not become sidebar projects.
 
+If `thread-workspace-root-hints` is empty but `state_5.sqlite` is healthy, add `--rebuild-hints-from-state-db`. This reads active thread rows from SQLite and rebuilds global-state hints without writing SQLite.
+
+If the current global-state file is nearly empty after a crash or reset, add `--seed-roots-from-backups` to recover saved project roots from the newest global-state backup that still has `electron-saved-workspace-roots`.
+
 If Codex keeps rewriting `.codex-global-state.json` from memory, run a short loop while the user fully quits and reopens Codex:
 
 ```powershell
