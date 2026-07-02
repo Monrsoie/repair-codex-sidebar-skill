@@ -59,7 +59,7 @@ If `.codex-global-state.json` has lost `thread-workspace-root-hints` entirely bu
 python .\skills\repair-codex-sidebar\scripts\repair_codex_sidebar.py --global-state-only --rebuild-hints-from-state-db --include-hinted-roots
 ```
 
-After crashes or accidental resets, the current global-state file may be nearly empty while older backups still contain the project root list. Seed roots from those backups:
+After crashes or accidental resets, the current global-state file may be nearly empty while older backups still contain the project root list. Seed roots from the backup with the largest saved root list:
 
 ```powershell
 python .\skills\repair-codex-sidebar\scripts\repair_codex_sidebar.py --global-state-only --seed-roots-from-backups --rebuild-hints-from-state-db --include-hinted-roots

@@ -334,7 +334,18 @@ def read_active_thread_rows(codex_home: Path) -> list[tuple[str, str]]:
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
         return conn.execute(
-            "SELECT id, cwd FROM threads WHERE archived=0 AND has_user_event=1 AND source='vscode'"
+            """
+            SELECT id, cwd
+            FROM threads
+            WHERE archived=0
+              AND cwd IS NOT NULL
+              AND cwd <> ''
+              AND (
+                has_user_event=1
+                OR thread_source='user'
+                OR source='vscode'
+              )
+            """
         ).fetchall()
     finally:
         conn.close()
@@ -350,14 +361,15 @@ def seed_roots_from_global_state_backups(codex_home: Path) -> list[str]:
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
+    best_roots: list[str] = []
     for path in candidates:
         data = read_json(path, {})
         if not isinstance(data, dict):
             continue
         roots = coerce_string_list(data.get("electron-saved-workspace-roots"))
-        if roots:
-            return roots
-    return []
+        if len(roots) > len(best_roots):
+            best_roots = roots
+    return best_roots
 
 
 def merge_session_index(codex_home: Path, old_home: Path | None) -> int:
